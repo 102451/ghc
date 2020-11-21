@@ -20,8 +20,32 @@ void printLoadedObjects(void);
 
 #include "BeginPrivate.h"
 
+/* Which object file format are we targeting? */
+#if defined(linux_HOST_OS) || defined(solaris2_HOST_OS) \
+|| defined(linux_android_HOST_OS) \
+|| defined(freebsd_HOST_OS) || defined(kfreebsdgnu_HOST_OS) \
+|| defined(dragonfly_HOST_OS) || defined(netbsd_HOST_OS) \
+|| defined(openbsd_HOST_OS) || defined(gnu_HOST_OS)
+#  define OBJFORMAT_ELF
+#elif defined(mingw32_HOST_OS)
+#  define OBJFORMAT_PEi386
+#elif defined(darwin_HOST_OS) || defined(ios_HOST_OS)
+#  define OBJFORMAT_MACHO
+#endif
+
 typedef void SymbolAddr;
 typedef char SymbolName;
+
+#if defined(OBJFORMAT_ELF)
+#  include "linker/ElfTypes.h"
+#elif defined(OBJFORMAT_PEi386)
+#  include "linker/PEi386Types.h"
+#elif defined(OBJFORMAT_MACHO)
+#  include "linker/MachOTypes.h"
+#else
+#  error "Unknown OBJECT_FORMAT for HOST_OS"
+#endif
+
 
 /* Hold extended information about a symbol in case we need to resolve it at a
    late stage.  */
@@ -306,6 +330,10 @@ typedef struct _ObjectCode {
 
 #if defined(THREADED_RTS)
 extern Mutex linker_mutex;
+
+#if defined(OBJFORMAT_ELF) || defined(OBJFORMAT_MACHO)
+extern Mutex dl_mutex;
+#endif
 #endif
 
 /* Type of the initializer */
@@ -388,6 +416,7 @@ resolveSymbolAddr (pathchar* buffer, int size,
 #endif
 
 HsInt isAlreadyLoaded( pathchar *path );
+OStatus getObjectLoadStatus_ (pathchar *path);
 HsInt loadOc( ObjectCode* oc );
 ObjectCode* mkOc( ObjectType type, pathchar *path, char *image, int imageSize,
                   bool mapped, pathchar *archiveMemberName,
@@ -401,24 +430,6 @@ void freeSegments(ObjectCode *oc);
    e.g. OS X (before Sierra), OpenBSD etc */
 #if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
 #define MAP_ANONYMOUS MAP_ANON
-#endif
-
-/* Which object file format are we targeting? */
-#if defined(linux_HOST_OS) || defined(solaris2_HOST_OS) \
-|| defined(linux_android_HOST_OS) \
-|| defined(freebsd_HOST_OS) || defined(kfreebsdgnu_HOST_OS) \
-|| defined(dragonfly_HOST_OS) || defined(netbsd_HOST_OS) \
-|| defined(openbsd_HOST_OS) || defined(gnu_HOST_OS)
-#  define OBJFORMAT_ELF
-#  include "linker/ElfTypes.h"
-#elif defined(mingw32_HOST_OS)
-#  define OBJFORMAT_PEi386
-#  include "linker/PEi386Types.h"
-#elif defined(darwin_HOST_OS) || defined(ios_HOST_OS)
-#  define OBJFORMAT_MACHO
-#  include "linker/MachOTypes.h"
-#else
-#error "Unknown OBJECT_FORMAT for HOST_OS"
 #endif
 
 /* In order to simplify control flow a bit, some references to mmap-related
