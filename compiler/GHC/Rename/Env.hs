@@ -648,14 +648,13 @@ lookupSubBndrOcc_helper must_have_parent warn_if_deprec parent rdr_name
           case original_gres of
             [] ->  return NameNotFound
             [g] -> return $ IncorrectParent parent
-                              (gre_name g) (ppr $ gre_name g)
+                              (gre_child g)
                               [p | Just p <- [getParent g]]
             gss@(g:gss'@(_:_)) ->
               if all isRecFldGRE gss && overload_ok
                 then return $
                       IncorrectParent parent
-                        (gre_name g)
-                        (ppr $ expectJust "noMatchingParentErr" (greLabel g))
+                        (gre_child g)
                         [p | x <- gss, Just p <- [getParent x]]
                 else mkNameClashErr $ g NE.:| gss'
 
@@ -735,8 +734,7 @@ instance Monoid DisambigInfo where
 data ChildLookupResult
       = NameNotFound                --  We couldn't find a suitable name
       | IncorrectParent Name        -- Parent
-                        Name        -- Name of thing we were looking for
-                        SDoc        -- How to print the name
+                        Child       -- Child we were looking for
                         [Name]      -- List of possible parents
       | FoundChild Parent Child     --  We resolved to a child
 
@@ -752,8 +750,8 @@ combineChildLookupResult (x:xs) = do
 instance Outputable ChildLookupResult where
   ppr NameNotFound = text "NameNotFound"
   ppr (FoundChild p n) = text "Found:" <+> ppr p <+> ppr n
-  ppr (IncorrectParent p n td ns) = text "IncorrectParent"
-                                  <+> hsep [ppr p, ppr n, td, ppr ns]
+  ppr (IncorrectParent p n ns) = text "IncorrectParent"
+                                  <+> hsep [ppr p, ppr n, ppr ns]
 
 lookupSubBndrOcc :: Bool
                  -> Name     -- Parent
