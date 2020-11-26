@@ -14,13 +14,13 @@ import GHC.Prelude
 import GHC.Types.Basic ( SwapFlag(..),
                          infinity, IntWithInf, intGtLimit )
 import GHC.Tc.Solver.Canonical
-import GHC.Tc.Utils.Unify( canSolveByUnification )
 import GHC.Types.Var.Set
 import GHC.Core.Type as Type
 import GHC.Core.InstEnv         ( DFunInstType )
 
 import GHC.Types.Var
 import GHC.Tc.Utils.TcType
+import GHC.Tc.Utils.Unify ( canSolveByUnification )
 import GHC.Builtin.Names ( coercibleTyConKey, heqTyConKey, eqTyConKey, ipClassKey )
 import GHC.Core.Coercion.Axiom ( CoAxBranch (..), CoAxiom (..), TypeEqn, fromBranches, sfInteractInert, sfInteractTop )
 import GHC.Core.Class
@@ -39,6 +39,7 @@ import GHC.Tc.Types
 import GHC.Tc.Types.Constraint
 import GHC.Core.Predicate
 import GHC.Tc.Types.Origin
+import GHC.Tc.Utils.TcMType( promoteTyVarTo )
 import GHC.Tc.Solver.Monad
 import GHC.Data.Bag
 import GHC.Utils.Monad ( concatMapM, foldlM )
@@ -47,6 +48,7 @@ import GHC.Core
 import Data.List( partition, deleteFirstsBy )
 import GHC.Types.SrcLoc
 import GHC.Types.Var.Env
+import GHC.Types.Unique.Set( nonDetEltsUniqSet )
 
 import Control.Monad
 import GHC.Data.Maybe( isJust )
@@ -430,12 +432,11 @@ interactWithInertsStage :: WorkItem -> TcS (StopOrContinue Ct)
 
 interactWithInertsStage wi
   = do { inerts <- getTcSInerts
-       ; lvl  <- getTcLevel
        ; let ics = inert_cans inerts
        ; case wi of
-             CEqCan    {} -> interactEq lvl  ics wi
-             CIrredCan {} -> interactIrred   ics wi
-             CDictCan  {} -> interactDict    ics wi
+             CEqCan    {} -> interactEq    ics wi
+             CIrredCan {} -> interactIrred ics wi
+             CDictCan  {} -> interactDict  ics wi
              _ -> pprPanic "interactWithInerts" (ppr wi) }
                 -- CNonCanonical have been canonicalised
 
@@ -1439,8 +1440,8 @@ inertsCanDischarge inerts lhs rhs fr
       | otherwise
       = False  -- Work item is fully discharged
 
-interactEq :: TcLevel -> InertCans -> Ct -> TcS (StopOrContinue Ct)
-interactEq tclvl inerts workItem@(CEqCan { cc_lhs = lhs
+interactEq :: InertCans -> Ct -> TcS (StopOrContinue Ct)
+interactEq inerts workItem@(CEqCan { cc_lhs = lhs
                                          , cc_rhs = rhs
                                          , cc_ev = ev
                                          , cc_eq_rel = eq_rel })
@@ -1473,17 +1474,62 @@ interactEq tclvl inerts workItem@(CEqCan { cc_lhs = lhs
 
   | TyVarLHS tv <- lhs
   , not (isGiven ev)    -- See Note [Touchables and givens]
-  , canSolveByUnification tclvl tv rhs
-  = do { solveByUnification ev tv rhs
-       ; n_kicked <- kickOutAfterUnification tv
-       ; return (Stop ev (text "Solved by unification" <+> pprKicked n_kicked)) }
+  , MetaTv { mtv_tclvl = tv_lvl, mtv_info = info } <- tcTyVarDetails tv
+  = do { ambient_lvl  <- getTcLevel
+       ; given_eq_lvl <- getInnermostGivenEqLevel
+       ; tryToSolveByUnification ambient_lvl given_eq_lvl workItem ev tv tv_lvl info rhs }
 
   | otherwise
   = continueWith workItem
 
-interactEq _ _ wi = pprPanic "interactEq" (ppr wi)
+interactEq _ wi = pprPanic "interactEq" (ppr wi)
 
-solveByUnification :: CtEvidence -> TcTyVar -> Xi -> TcS ()
+----------------------
+-- We have a meta-tyvar on the left, and metaTyVarUpateOK has said "yes"
+-- So try to solve by unifying.
+-- Three reasons why not:
+--    Skolem escape
+--    Given equalities (GADTs)
+--    Unifying a TyVarTv with a non-tyvar type
+tryToSolveByUnification :: TcLevel   -- Ambient level
+                        -> TcLevel   -- Level of innermost given equality
+                        -> Ct -> CtEvidence
+                        -> TcTyVar -> TcLevel -> MetaInfo
+                            -- LHS tyvar, its level, and MetaInfo
+                            -- Always a meta tyvar
+                        -> TcType              -- RHS
+                        -> TcS (StopOrContinue Ct)
+tryToSolveByUnification ambient_lvl given_eq_lvl
+                        work_item ev tv tv_lvl info rhs
+  | not (canSolveByUnification info rhs)
+  = continueWith work_item
+
+  | tv_lvl `sameDepthAs` ambient_lvl         -- Short cut
+  = solveByUnification ev tv rhs
+
+  | tv_lvl `deeperThanOrSame` given_eq_lvl   -- No intervening given equalities
+  , all does_not_escape free_skols           -- No skolem escapes
+  = do { wrapTcS $ mapM_ (promoteTyVarTo tv_lvl) free_metas
+       ; setUnificationFlag tv_lvl   -- We do this only if tv_lvl < ambient_lvl
+       ; solveByUnification ev tv rhs }
+  | otherwise
+  = continueWith work_item
+  where
+     fvs = nonDetEltsUniqSet $ tyCoVarsOfType rhs
+     (free_metas, free_skols) = partition is_promotable fvs
+
+     does_not_escape fv
+       | isTyVar fv = tv_lvl `deeperThanOrSame` tcTyVarLevel fv
+       | otherwise  = True   -- Coercion variables
+
+     is_promotable fv
+       | isTyVar fv
+       , MetaTv { mtv_info = info } <- tcTyVarDetails fv
+       = isTouchableInfo info   -- Can't promote cycle breakers
+       | otherwise
+       = False
+
+solveByUnification :: CtEvidence -> TcTyVar -> Xi -> TcS (StopOrContinue Ct)
 -- Solve with the identity coercion
 -- Precondition: kind(xi) equals kind(tv)
 -- Precondition: CtEvidence is Wanted or Derived
@@ -1505,9 +1551,10 @@ solveByUnification wd tv xi
                              text "Coercion:" <+> pprEq tv_ty xi,
                              text "Left Kind is:" <+> ppr (tcTypeKind tv_ty),
                              text "Right Kind is:" <+> ppr (tcTypeKind xi) ]
-
        ; unifyTyVar tv xi
-       ; setEvBindIfWanted wd (evCoercion (mkTcNomReflCo xi)) }
+       ; setEvBindIfWanted wd (evCoercion (mkTcNomReflCo xi))
+       ; n_kicked <- kickOutAfterUnification tv
+       ; return (Stop wd (text "Solved by unification" <+> pprKicked n_kicked)) }
 
 {- Note [Avoid double unifications]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

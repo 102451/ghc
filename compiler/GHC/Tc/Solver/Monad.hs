@@ -17,7 +17,7 @@ module GHC.Tc.Solver.Monad (
 
     -- The TcS monad
     TcS, runTcS, runTcSDeriveds, runTcSWithEvBinds, runTcSInerts,
-    failTcS, warnTcS, addErrTcS,
+    failTcS, warnTcS, addErrTcS, wrapTcS,
     runTcSEqualities,
     nestTcS, nestImplicTcS, setEvBindsTcS,
     emitImplicationTcS, emitTvImplicationTcS,
@@ -31,6 +31,7 @@ module GHC.Tc.Solver.Monad (
     panicTcS, traceTcS,
     traceFireTcS, bumpStepCountTcS, csTraceTcS,
     wrapErrTcS, wrapWarnTcS,
+    getUnificationFlag, setUnificationFlag,
 
     -- Evidence creation and transformation
     MaybeNew(..), freshGoals, isFresh, getEvExpr,
@@ -60,7 +61,7 @@ module GHC.Tc.Solver.Monad (
     updInertTcS, updInertCans, updInertDicts, updInertIrreds,
     getHasGivenEqs, setInertCans,
     getInertEqs, getInertCans, getInertGivens,
-    getInertInsols,
+    getInertInsols, getInnermostGivenEqLevel,
     getTcSInerts, setTcSInerts,
     matchableGivens, prohibitedSuperClassSolve, mightMatchLater,
     getUnsolvedInerts,
@@ -431,6 +432,7 @@ instance Outputable InertSet where
 emptyInertCans :: InertCans
 emptyInertCans
   = IC { inert_count    = 0
+       , inert_ge_lvl   = topTcLevel
        , inert_eqs      = emptyDVarEnv
        , inert_dicts    = emptyDicts
        , inert_safehask = emptyDicts
@@ -710,6 +712,9 @@ data InertCans   -- See Note [Detailed InertCans Invariants] for more
               -- Irreducible predicates that cannot be made canonical,
               --     and which don't interact with others (e.g.  (c a))
               -- and insoluble predicates (e.g.  Int ~ Bool, or a ~ [a])
+
+       , inert_ge_lvl :: TcLevel   -- The TcLevel of the innermost implication
+                                   -- that has Given equalities
 
        , inert_count :: Int
               -- Number of Wanted goals in
@@ -1046,8 +1051,9 @@ instance Outputable InertCans where
   ppr (IC { inert_eqs = eqs
           , inert_funeqs = funeqs, inert_dicts = dicts
           , inert_safehask = safehask, inert_irreds = irreds
-          , inert_insts = insts
-          , inert_count = count })
+          , inert_insts  = insts
+          , inert_ge_lvl = ge_lvl
+          , inert_count  = count })
     = braces $ vcat
       [ ppUnless (isEmptyDVarEnv eqs) $
         text "Equalities:"
@@ -1062,6 +1068,7 @@ instance Outputable InertCans where
         text "Irreds =" <+> pprCts irreds
       , ppUnless (null insts) $
         text "Given instances =" <+> vcat (map ppr insts)
+      , text "Innermost given equalities =" <+> ppr ge_lvl
       , text "Unsolved goals =" <+> int count
       ]
     where
@@ -1476,20 +1483,28 @@ findEq icans (TyFamLHS fun_tc fun_args)
 addInertForAll :: QCInst -> TcS ()
 -- Add a local Given instance, typically arising from a type signature
 addInertForAll new_qci
-  = do { ics <- getInertCans
-       ; insts' <- add_qci (inert_insts ics)
-       ; setInertCans (ics { inert_insts = insts' }) }
+  = do { ics  <- getInertCans
+       ; ics1 <- add_qci ics
+
+       -- C.f add_given_eq
+       ; tclvl <- getTcLevel
+       ; let ics2 | tclvl `strictlyDeeperThan` inert_ge_lvl ics1
+                  = ics1 { inert_ge_lvl = tclvl }
+                  | otherwise
+                  = ics1
+
+       ; setInertCans ics2 }
   where
-    add_qci :: [QCInst] -> TcS [QCInst]
+    add_qci :: InertCans -> TcS InertCans
     -- See Note [Do not add duplicate quantified instances]
-    add_qci qcis
+    add_qci ics@(IC { inert_insts = qcis })
       | any same_qci qcis
       = do { traceTcS "skipping duplicate quantified instance" (ppr new_qci)
-           ; return qcis }
+           ; return ics }
 
       | otherwise
       = do { traceTcS "adding new inert quantified instance" (ppr new_qci)
-           ; return (new_qci : qcis) }
+           ; return (ics { inert_insts = new_qci : qcis }) }
 
     same_qci old_qci = tcEqType (ctEvPred (qci_ev old_qci))
                                 (ctEvPred (qci_ev new_qci))
@@ -1543,7 +1558,8 @@ addInertCan ct
        ; ics <- getInertCans
        ; ct  <- maybeEmitShadow ics ct
        ; ics <- maybeKickOut ics ct
-       ; setInertCans (add_item ics ct)
+       ; tclvl <- getTcLevel
+       ; setInertCans (add_item tclvl ics ct)
 
        ; traceTcS "addInertCan }" $ empty }
 
@@ -1556,30 +1572,59 @@ maybeKickOut ics ct
   | otherwise
   = return ics
 
-add_item :: InertCans -> Ct -> InertCans
-add_item ics item@(CEqCan { cc_lhs = TyFamLHS tc tys })
-  = ics { inert_funeqs = addCanFunEq (inert_funeqs ics) tc tys item }
+add_item :: TcLevel -> InertCans -> Ct -> InertCans
+add_item tc_lvl
+         ics@(IC { inert_funeqs = funeqs, inert_eqs = eqs, inert_count = count })
+         item@(CEqCan { cc_lhs = lhs, cc_ev = ev })
+  = add_given_eq tc_lvl item $
+    case lhs of
+       TyFamLHS tc tys -> ics { inert_funeqs = addCanFunEq funeqs tc tys item }
+       TyVarLHS tv     -> ics { inert_eqs    = addTyEq eqs tv item
+                              , inert_count  = bumpUnsolvedCount ev count }
 
-add_item ics item@(CEqCan { cc_lhs = TyVarLHS tv, cc_ev = ev })
-  = ics { inert_eqs   = addTyEq (inert_eqs ics) tv item
-        , inert_count = bumpUnsolvedCount ev (inert_count ics) }
-
-add_item ics@(IC { inert_irreds = irreds, inert_count = count })
+add_item tc_lvl
+         ics@(IC { inert_irreds = irreds, inert_count = count })
          item@(CIrredCan { cc_ev = ev, cc_status = status })
-  = ics { inert_irreds = irreds `Bag.snocBag` item
+  = add_given_eq tc_lvl item $   -- An Irred might turn out to be an
+                                 -- equality, so we play safe
+    ics { inert_irreds = irreds `Bag.snocBag` item
         , inert_count  = case status of
                            InsolubleCIS -> count
                            _            -> bumpUnsolvedCount ev count }
                               -- inert_count does not include insolubles
 
 
-add_item ics item@(CDictCan { cc_ev = ev, cc_class = cls, cc_tyargs = tys })
+add_item _ ics item@(CDictCan { cc_ev = ev, cc_class = cls, cc_tyargs = tys })
   = ics { inert_dicts = addDict (inert_dicts ics) cls tys item
         , inert_count = bumpUnsolvedCount ev (inert_count ics) }
 
-add_item _ item
+add_item _ _ item
   = pprPanic "upd_inert set: can't happen! Inserting " $
     ppr item   -- Can't be CNonCanonical because they only land in inert_irreds
+
+add_given_eq :: TcLevel -> Ct -> InertCans -> InertCans
+-- Set the inert_ge_level to the current level (tclvl)
+-- if the constraint is a given equality that should prevent
+-- filling in an outer unification variable.
+-- See See Note [When does an implication have given equalities?]
+--
+-- ToDo: what about Quantified Constraints?
+add_given_eq tclvl ct inerts
+  | isGivenCt ct
+  , tclvl `strictlyDeeperThan` inert_ge_lvl inerts
+  , ct_prevents_floating
+  = inerts { inert_ge_lvl = tclvl }
+  | otherwise
+  = inerts
+  where
+    ct_prevents_floating
+      = case ct of
+          CEqCan { cc_lhs = TyVarLHS tv }
+                        -> isOuterTyVar tclvl tv
+                           -- No need to look at RHS
+                           -- See Note [Let-bound skolems]
+          CDictCan {}   -> False
+          _             -> mentionsOuterVar tclvl (ctEvidence ct)
 
 bumpUnsolvedCount :: CtEvidence -> Int -> Int
 bumpUnsolvedCount ev n | isWanted ev = n+1
@@ -1633,6 +1678,7 @@ kick_out_rewritable new_fr new_lhs
                             , inert_funeqs   = funeqmap
                             , inert_irreds   = irreds
                             , inert_insts    = old_insts
+                            , inert_ge_lvl   = ge_lvl
                             , inert_count    = n })
   | not (new_fr `eqMayRewriteFR` new_fr)
   = (emptyWorkList, ics)
@@ -1650,6 +1696,7 @@ kick_out_rewritable new_fr new_lhs
                        , inert_funeqs   = feqs_in
                        , inert_irreds   = irs_in
                        , inert_insts    = insts_in
+                       , inert_ge_lvl   = ge_lvl
                        , inert_count    = n - workListWantedCount kicked_out }
 
     kicked_out :: WorkList
@@ -2003,6 +2050,10 @@ updInertIrreds upd_fn
 getInertEqs :: TcS (DTyVarEnv EqualCtList)
 getInertEqs = do { inert <- getInertCans; return (inert_eqs inert) }
 
+getInnermostGivenEqLevel :: TcS TcLevel
+getInnermostGivenEqLevel = do { inert <- getInertCans
+                              ; return (inert_ge_lvl inert) }
+
 getInertInsols :: TcS Cts
 -- Returns insoluble equality constraints
 -- specifically including Givens
@@ -2114,13 +2165,15 @@ getHasGivenEqs :: TcLevel           -- TcLevel of this implication
                       , Cts )       -- Insoluble equalities arising from givens
 -- See Note [When does an implication have given equalities?]
 getHasGivenEqs tclvl
-  = do { inerts@(IC { inert_eqs = ieqs, inert_funeqs = funeqs, inert_irreds = irreds })
+  = do { inerts@(IC { inert_eqs = ieqs, inert_funeqs = funeqs
+                    , inert_irreds = irreds, inert_insts = qc_insts })
               <- getInertCans
        ; let has_given_eqs = foldMap check_local_given_ct irreds
                         S.<> foldMap (lift_equal_ct_list check_local_given_tv_eq) ieqs
                         S.<> foldMapFunEqs (lift_equal_ct_list check_local_given_ct) funeqs
+                        S.<> foldMap qc_eq_inst_given_here qc_insts
              insols = filterBag insolubleEqCt irreds
-                      -- Specifically includes ones that originated in some
+                       -- Specifically includes ones that originated in some
                       -- outer context but were refined to an insoluble by
                       -- a local equality; so do /not/ add ct_given_here.
 
@@ -2130,44 +2183,53 @@ getHasGivenEqs tclvl
               , text "Insols:" <+> ppr insols]
        ; return (has_given_eqs, insols) }
   where
-    check_local_given_ct :: Ct -> HasGivenEqs
-    check_local_given_ct ct
-      | given_here ev = if mentions_outer_var ev then MaybeGivenEqs else LocalGivenEqs
-      | otherwise     = NoGivenEqs
-      where
-        ev = ctEvidence ct
-
     lift_equal_ct_list :: (Ct -> HasGivenEqs) -> EqualCtList -> HasGivenEqs
     -- returns NoGivenEqs for non-singleton lists, as Given lists are always
     -- singletons
     lift_equal_ct_list check (EqualCtList (ct :| [])) = check ct
     lift_equal_ct_list _     _                        = NoGivenEqs
 
+    check_local_given_ct :: Ct -> HasGivenEqs
+    check_local_given_ct ct = check_local_given_ev (ctEvidence ct)
+
+    check_local_given_ev :: CtEvidence -> HasGivenEqs
+    check_local_given_ev ev
+      | not (given_bound_here ev) = NoGivenEqs
+      | mentionsOuterVar tclvl ev = MaybeGivenEqs
+      | otherwise                 = LocalGivenEqs
+
     check_local_given_tv_eq :: Ct -> HasGivenEqs
     check_local_given_tv_eq (CEqCan { cc_lhs = TyVarLHS tv, cc_ev = ev})
-      | given_here ev
-      = if is_outer_var tv then MaybeGivenEqs else NoGivenEqs
-        -- See Note [Let-bound skolems]
-      | otherwise
-      = NoGivenEqs
-    check_local_given_tv_eq other_ct = check_local_given_ct other_ct
+      | not (given_bound_here ev) = NoGivenEqs
+      | isOuterTyVar tclvl tv     = MaybeGivenEqs
+      | otherwise                 = NoGivenEqs   -- See Note [Let-bound skolems]
+    check_local_given_tv_eq other_ct
+      = check_local_given_ct other_ct
 
-    given_here :: CtEvidence -> Bool
+    qc_eq_inst_given_here :: QCInst -> HasGivenEqs
+    -- True of a quantified constraint (which are always Given)
+    -- for an equality, bound by this implication
+    qc_eq_inst_given_here (QCI { qci_ev = ev, qci_pred = pred })
+       | isEqPred pred = check_local_given_ev ev
+       | otherwise     = NoGivenEqs
+
+    given_bound_here :: CtEvidence -> Bool
     -- True for a Given bound by the current implication,
     -- i.e. the current level
-    given_here ev =  isGiven ev
-                  && tclvl == ctLocLevel (ctEvLoc ev)
+    given_bound_here ev =  isGiven ev &&
+                           tclvl == ctLocLevel (ctEvLoc ev)
 
-    mentions_outer_var :: CtEvidence -> Bool
-    mentions_outer_var = anyFreeVarsOfType is_outer_var . ctEvPred
+mentionsOuterVar :: TcLevel -> CtEvidence -> Bool
+mentionsOuterVar tclvl ev = anyFreeVarsOfType (isOuterTyVar tclvl) $
+                            ctEvPred ev
 
-    is_outer_var :: TyCoVar -> Bool
-    is_outer_var tv
+isOuterTyVar :: TcLevel -> TyCoVar -> Bool
+isOuterTyVar tclvl tv
             -- NB: a meta-tv alpha[3] may end up unifying with skolem b[2],
             -- so treat it as an "outer" var, even at level 3.
-      | isTyVar tv = isTouchableMetaTyVar tclvl tv ||
-                     tclvl `strictlyDeeperThan` tcTyVarLevel tv
-      | otherwise  = False
+  | isTyVar tv = isTouchableMetaTyVar tclvl tv ||
+                 tclvl `strictlyDeeperThan` tcTyVarLevel tv
+  | otherwise  = False
 
 -- | Returns Given constraints that might,
 -- potentially, match the given pred. This is used when checking to see if a
@@ -2757,6 +2819,10 @@ data TcSEnv
          -- The number of unification variables we have filled
          -- The important thing is whether it is non-zero
 
+      tcs_unif_lvl  :: IORef (Maybe TcLevel),
+         -- Outermost level at which we have unified a meta tyvar
+         -- Starts at Nothing, then (Just i), then (Just j) where j<i
+
       tcs_count     :: IORef Int, -- Global step count
 
       tcs_inerts    :: IORef InertSet, -- Current inert set
@@ -2830,6 +2896,38 @@ bumpStepCountTcS :: TcS ()
 bumpStepCountTcS = TcS $ \env -> do { let ref = tcs_count env
                                     ; n <- TcM.readTcRef ref
                                     ; TcM.writeTcRef ref (n+1) }
+
+getUnificationFlag :: TcS Bool
+-- We are at ambient level i
+-- If the unification flag = Just i, set it to Nothing and return True
+-- Otherwise return False
+getUnificationFlag
+  = TcS $ \env ->
+    do { let ref = tcs_unif_lvl env
+       ; ambient_lvl <- TcM.getTcLevel
+       ; mb_lvl <- TcM.readTcRef ref
+       ; TcM.traceTc "getUnificationFlag" $
+         vcat [ text "ambient:" <+> ppr ambient_lvl
+              , text "unif_lvl:" <+> ppr mb_lvl ]
+       ; case mb_lvl of
+           Nothing       -> return False
+           Just unif_lvl | ambient_lvl `strictlyDeeperThan` unif_lvl
+                         -> return False
+                         | otherwise
+                         -> do { TcM.writeTcRef ref Nothing
+                               ; return True } }
+
+setUnificationFlag :: TcLevel -> TcS ()
+-- (setUnificationFlag i) sets the unification level to (Just i)
+-- unless it already is (Just j) where j <= i
+setUnificationFlag lvl
+  = TcS $ \env ->
+    do { let ref = tcs_unif_lvl env
+       ; mb_lvl <- TcM.readTcRef ref
+       ; case mb_lvl of
+           Just unif_lvl | lvl `deeperThanOrSame` unif_lvl
+                         -> return ()
+           _ -> TcM.writeTcRef ref (Just lvl) }
 
 csTraceTcS :: SDoc -> TcS ()
 csTraceTcS doc
@@ -2911,8 +3009,10 @@ runTcSWithEvBinds' restore_cycles ev_binds_var tcs
        ; step_count <- TcM.newTcRef 0
        ; inert_var <- TcM.newTcRef emptyInert
        ; wl_var <- TcM.newTcRef emptyWorkList
+       ; unif_lvl_var <- TcM.newTcRef Nothing
        ; let env = TcSEnv { tcs_ev_binds      = ev_binds_var
                           , tcs_unified       = unified_var
+                          , tcs_unif_lvl      = unif_lvl_var
                           , tcs_count         = step_count
                           , tcs_inerts        = inert_var
                           , tcs_worklist      = wl_var }
@@ -2975,15 +3075,17 @@ nestImplicTcS ref inner_tclvl (TcS thing_inside)
   = TcS $ \ TcSEnv { tcs_unified       = unified_var
                    , tcs_inerts        = old_inert_var
                    , tcs_count         = count
+                   , tcs_unif_lvl      = unif_lvl
                    } ->
     do { inerts <- TcM.readTcRef old_inert_var
        ; let nest_inert = inerts { inert_cycle_breakers = [] }
                  -- all other InertSet fields are inherited
        ; new_inert_var <- TcM.newTcRef nest_inert
        ; new_wl_var    <- TcM.newTcRef emptyWorkList
-       ; let nest_env = TcSEnv { tcs_ev_binds      = ref
+       ; let nest_env = TcSEnv { tcs_count         = count     -- Inherited
+                               , tcs_unif_lvl      = unif_lvl  -- Inherited
+                               , tcs_ev_binds      = ref
                                , tcs_unified       = unified_var
-                               , tcs_count         = count
                                , tcs_inerts        = new_inert_var
                                , tcs_worklist      = new_wl_var }
        ; res <- TcM.setTcLevel inner_tclvl $
