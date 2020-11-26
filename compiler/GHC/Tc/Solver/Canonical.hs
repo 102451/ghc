@@ -2269,7 +2269,7 @@ canEqCanLHS2 ev eq_rel swapped lhs1 ps_xi1 lhs2 ps_xi2 mco
 
 -- This function handles the case where one side is a tyvar and the other is
 -- a type family application. Which to put on the left?
---   If we can unify the variable, put it on the left, as this may be our only
+--   If the tyvar is a meta-tyvar, put it on the left, as this may be our only
 --   shot to unify.
 --   Otherwise, put the function on the left, because it's generally better to
 --   rewrite away function calls. This makes types smaller. And it seems necessary:
@@ -2288,17 +2288,16 @@ canEqTyVarFunEq :: CtEvidence               -- :: lhs ~ (rhs |> mco)
                 -> MCoercion                -- :: kind(rhs) ~N kind(lhs)
                 -> TcS (StopOrContinue Ct)
 canEqTyVarFunEq ev eq_rel swapped tv1 ps_xi1 fun_tc2 fun_args2 ps_xi2 mco
-  = do { tclvl <- getTcLevel
-       ; dflags <- getDynFlags
-       ; if | isTouchableMetaTyVar tclvl tv1
-              , MTVU_OK _ <- checkTyVarEq dflags YesTypeFamilies tv1 (ps_xi2 `mkCastTyMCo` mco)
-              -> canEqCanLHSFinish ev eq_rel swapped (TyVarLHS tv1)
-                                                     (ps_xi2 `mkCastTyMCo` mco)
+  = do { -- tclvl <- getTcLevel
+         -- dflags <- getDynFlags
+       ; if | isMetaTyVar tv1
+            -> canEqCanLHSFinish ev eq_rel swapped (TyVarLHS tv1)
+                                                   (ps_xi2 `mkCastTyMCo` mco)
             | otherwise
-              -> do { new_ev <- rewriteCastedEquality ev eq_rel swapped
+            -> do { new_ev <- rewriteCastedEquality ev eq_rel swapped
                                   (mkTyVarTy tv1) (mkTyConApp fun_tc2 fun_args2)
                                   mco
-                    ; canEqCanLHSFinish new_ev eq_rel IsSwapped
+                  ; canEqCanLHSFinish new_ev eq_rel IsSwapped
                                   (TyFamLHS fun_tc2 fun_args2)
                                   (ps_xi1 `mkCastTyMCo` sym_mco) } }
   where
