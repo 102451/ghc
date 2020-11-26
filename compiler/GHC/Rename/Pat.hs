@@ -58,8 +58,7 @@ import GHC.Rename.Fixity
 import GHC.Rename.Utils    ( HsDocContext(..), newLocalBndrRn, bindLocalNames
                            , warnUnusedMatches, newLocalBndrRn
                            , checkUnusedRecordWildcard
-                           , checkDupNames, checkDupAndShadowedNames
-                           , unknownSubordinateErr )
+                           , checkDupNames, checkDupAndShadowedNames )
 import GHC.Rename.HsType
 import GHC.Builtin.Names
 import GHC.Types.Name
@@ -740,8 +739,6 @@ rnHsRecUpdFields flds
 
        ; return (flds1, plusFVs fvss) }
   where
-    doc = text "constructor field name"
-
     rn_fld :: Bool -> DuplicateRecordFields -> LHsRecUpdField GhcPs
            -> RnM (LHsRecUpdField GhcRn, FreeVars)
     rn_fld pun_ok overload_ok (L l (HsRecField { hsRecFieldLbl = L loc f
@@ -751,16 +748,7 @@ rnHsRecUpdFields flds
            ; sel <- setSrcSpan loc $
                       -- Defer renaming of overloaded fields to the typechecker
                       -- See Note [Disambiguating record fields] in GHC.Tc.Gen.Head
-                      -- AMG TODO: not clear why we need this test, but T11941 fails if we don't
-                      if overload_ok == DuplicateRecordFields
-                          then do  { mb <- lookupGlobalOccRn_overloaded_sel overload_ok lbl
-                                   ; case mb of
-                                       Nothing ->
-                                         do { addErr
-                                              (unknownSubordinateErr doc lbl)
-                                            ; return Nothing }
-                                       Just r -> return $ Just r }
-                          else fmap (Just . LookupOccRnUnique) $ lookupGlobalOccRn lbl
+                      lookupGlobalOccRn_overloaded IncludeFieldsWithoutSelectors overload_ok lbl
            ; arg' <- if pun
                      then do { checkErr pun_ok (badPun (L loc lbl))
                                -- Discard any module qualifier (#11662)
@@ -770,13 +758,13 @@ rnHsRecUpdFields flds
            ; (arg'', fvs) <- rnLExpr arg'
 
            ; let fvs' = case sel of -- AMG TODO review this
-                          Just (LookupOccRnUnique sel_name) -> fvs `addOneFV` sel_name
-                          Just (LookupOccRnSelectors (fld NE.:| [])) -> fvs `addOneFV` flSelector fld
+                          LookupOccName sel_name -> fvs `addOneFV` sel_name
+                          LookupOccFields (fld NE.:| []) -> fvs `addOneFV` flSelector fld
                           _       -> fvs
                  lbl' = case sel of
-                          Just (LookupOccRnUnique sel_name) ->
+                          LookupOccName sel_name ->
                                      L loc (Unambiguous sel_name   (L loc lbl))
-                          Just (LookupOccRnSelectors (fld NE.:| [])) ->
+                          LookupOccFields (fld NE.:| []) ->
                                      L loc (Unambiguous (flSelector fld) (L loc lbl))
                           _ -> L loc (Ambiguous   noExtField (L loc lbl))
 
