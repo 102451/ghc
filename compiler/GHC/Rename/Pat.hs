@@ -745,10 +745,10 @@ rnHsRecUpdFields flds
                                                , hsRecFieldArg = arg
                                                , hsRecPun      = pun }))
       = do { let lbl = rdrNameAmbiguousFieldOcc f
-           ; sel <- setSrcSpan loc $
+           ; mb_sel <- setSrcSpan loc $
                       -- Defer renaming of overloaded fields to the typechecker
                       -- See Note [Disambiguating record fields] in GHC.Tc.Gen.Head
-                      lookupGlobalOccRn_overloaded IncludeFieldsWithoutSelectors overload_ok lbl
+                      lookupRecFieldOcc_update overload_ok lbl
            ; arg' <- if pun
                      then do { checkErr pun_ok (badPun (L loc lbl))
                                -- Discard any module qualifier (#11662)
@@ -757,18 +757,11 @@ rnHsRecUpdFields flds
                      else return arg
            ; (arg'', fvs) <- rnLExpr arg'
 
-           ; let fvs' = case sel of -- AMG TODO review this
-                          LookupOccName sel_name -> fvs `addOneFV` sel_name
-                          LookupOccFields (fld NE.:| []) -> fvs `addOneFV` flSelector fld
-                          _       -> fvs
-                 lbl' = case sel of
-                          LookupOccName sel_name ->
-                                     L loc (Unambiguous sel_name   (L loc lbl))
-                          LookupOccFields (fld NE.:| []) ->
-                                     L loc (Unambiguous (flSelector fld) (L loc lbl))
-                          _ -> L loc (Ambiguous   noExtField (L loc lbl))
+           ; let (lbl', fvs') = case mb_sel of
+                   Just sel_name -> (Unambiguous sel_name   (L loc lbl), fvs `addOneFV` sel_name)
+                   Nothing       -> (Ambiguous   noExtField (L loc lbl), fvs)
 
-           ; return (L l (HsRecField { hsRecFieldLbl = lbl'
+           ; return (L l (HsRecField { hsRecFieldLbl = L loc lbl'
                                      , hsRecFieldArg = arg''
                                      , hsRecPun      = pun }), fvs') }
 

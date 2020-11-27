@@ -10,27 +10,38 @@ GHC.Rename.Env contains functions which convert RdrNames into Names.
 -}
 
 module GHC.Rename.Env (
+        -- * newTopSrcBinder
         newTopSrcBinder,
+
+        -- * Top-level binder occurrences
         lookupLocatedTopBndrRn, lookupTopBndrRn,
+
         lookupLocatedOccRn, lookupOccRn, lookupOccRn_maybe,
-        lookupLocalOccRn_maybe, lookupInfoOccRn,
-        lookupLocalOccThLvl_maybe, lookupLocalOccRn,
+        lookupInfoOccRn,
+        lookupLocalOccRn,
         lookupTypeOccRn,
         lookupGlobalOccRn, lookupGlobalOccRn_maybe,
+
         LookupOccResult(..),
         lookupOccRn_overloaded_maybe,
-        lookupGlobalOccRn_overloaded,
 
+        -- * lookupSubBndrOcc
         ChildLookupResult(..),
-        lookupSubBndrOcc_helper,
+        lookupInstDeclBndr,
+        lookupFamInstName,
         combineChildLookupResult, -- Called by lookupChildrenExport
 
+        -- * lookupBindGroupOcc
         HsSigCtxt(..), lookupLocalTcNames, lookupSigOccRn,
         lookupSigCtxtOccRn,
 
-        lookupInstDeclBndr, lookupRecFieldOcc, lookupFamInstName,
+        -- * Record field occurrences
         lookupConstructorFields,
+        lookupRecFieldOcc,
+        lookupRecFieldOcc_update,
 
+        -- * Export lists
+        lookupSubBndrOcc_helper,
         lookupGreAvailRn,
 
         -- Rebindable Syntax
@@ -75,7 +86,7 @@ import GHC.Core.DataCon
 import GHC.Core.TyCon
 import GHC.Utils.Error  ( MsgDoc )
 import GHC.Builtin.Names( rOOT_MAIN )
-import GHC.Types.Basic  ( TopLevelFlag(..), TupleSort(..) )
+import GHC.Types.Basic  ( TupleSort(..) )
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Utils.Outputable as Outputable
 import GHC.Types.Unique.Set ( uniqSetAny )
@@ -922,12 +933,6 @@ lookupLocalOccRn_maybe rdr_name
   = do { local_env <- getLocalRdrEnv
        ; return (lookupLocalRdrEnv local_env rdr_name) }
 
-lookupLocalOccThLvl_maybe :: Name -> RnM (Maybe (TopLevelFlag, ThLevel))
--- Just look in the local environment
-lookupLocalOccThLvl_maybe name
-  = do { lcl_env <- getLclEnv
-       ; return (lookupNameEnv (tcl_th_bndrs lcl_env) name) }
-
 -- lookupOccRn looks up an occurrence of a RdrName
 lookupOccRn :: RdrName -> RnM Name
 lookupOccRn rdr_name
@@ -946,6 +951,7 @@ lookupLocalOccRn rdr_name
            Nothing   -> unboundName WL_LocalOnly rdr_name }
 
 -- lookupTypeOccRn looks up an optionally promoted RdrName.
+-- Used for looking up type variables.
 lookupTypeOccRn :: RdrName -> RnM Name
 -- see Note [Demotion]
 lookupTypeOccRn rdr_name
@@ -1192,7 +1198,20 @@ lookupGlobalOccRn_resolve overload_ok rdr_name res = case res of
     addNameClashErrRn rdr_name gres
     return $ Just $ LookupOccName $ gre_name (NE.head gres)
 
--- | Used when looking up fields in record updates.
+-- | Used when looking up fields in record updates.  Returns 'Just' the selector
+-- name, or 'Nothing' if the field is ambiguous.  (Also returns 'Just' if the
+-- field is not in scope.)
+lookupRecFieldOcc_update
+  :: DuplicateRecordFields
+  -> RdrName
+  -> RnM (Maybe Name)
+lookupRecFieldOcc_update overload_ok rdr_name = do
+    res <- lookupGlobalOccRn_overloaded IncludeFieldsWithoutSelectors overload_ok rdr_name
+    case res of
+      LookupOccName sel_name        -> return (Just sel_name)
+      LookupOccFields (fl NE.:| []) -> return (Just (flSelector fl))
+      LookupOccFields (_ NE.:| _:_) -> return Nothing
+
 lookupGlobalOccRn_overloaded
   :: FieldsOrSelectors
   -> DuplicateRecordFields
